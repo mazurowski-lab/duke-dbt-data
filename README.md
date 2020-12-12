@@ -32,5 +32,12 @@ jupyter notebook --allow-root --ip=0.0.0.0 --port=8889
 
 ## read dicom image
 
-`dcmread_image.ipynb` notebook contains a python function that can be used to read image data from a DICOM file in the coordinate system that maches the ground truth bounding boxes.
+`dcmread_image.ipynb` notebook shows how to read image data from a DICOM file in the coordinate system that maches the ground truth bounding boxes.
 
+## draw bounding box
+
+`draw_box.ipynb` notebook shows how to draw a bounding box on the image.
+
+## helper functions
+
+To use helper functions from the notebooks, simply copy the `duke_dbt_data.py` file to your project.

@@ -1,6 +1,6 @@
 FROM python:3.8
 
-RUN pip install --upgrade pip==20.2.4
+RUN pip install --upgrade pip==20.3.1
 
 COPY requirements.txt ./
 

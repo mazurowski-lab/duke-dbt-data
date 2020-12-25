@@ -1,4 +1,4 @@
-from typing import AnyStr, BinaryIO, Optional, Union
+from typing import AnyStr, BinaryIO, Dict, NamedTuple, Optional, Union,
 
 import matplotlib
 import numpy as np
@@ -71,6 +71,85 @@ def draw_box(
     image[y : y + height, x : x + lw] = color
     image[y : y + height, x + width - lw : x + width] = color
     return image
+
+
+def evaluate(
+    labels_fp: pd._typing.FilePathOrBuffer,
+    boxes_fp: pd._typing.FilePathOrBuffer,
+    predictions_fp: pd._typing.FilePathOrBuffer
+) -> Dict[str, float]:
+    """Evaluate predictions"""
+    df_labels = pd.read_csv(labels_fp)
+    df_boxes = pd.read_csv(boxes_fp, dtype={"VolumeSlices": float})
+    df_pred = pd.read_csv(predictions_fp, dtype={"Score": float})
+
+    df_boxes = df_boxes.reset_index().set_index(["StudyUID", "View"]).sort_index()
+    df_pred = df_pred.reset_index().set_index(["StudyUID", "View"]).sort_index()
+
+    n_volumes = len(df_labels)
+    n_boxes = len(df_boxes)
+
+    df_pred["TP"] = 0
+    df_pred["GTID"] = 0
+
+    thresholds = [df_pred["Score"].max() + 1.0]
+
+    for box_pred in df_pred.itertuples():
+        if box_pred.Index not in df_boxes.index:
+            continue
+
+        df_boxes_view = df_boxes.loc[[box_pred.Index]]
+        view_slice_offset = df_boxes.loc[[box_pred.Index], "VolumeSlices"].iloc[0] / 4
+        tp_indices = [
+            b.index for b in df_boxes_view.itertuples() if is_tp(box_pred, b, slice_offset=view_slice_offset)
+        ]
+        if len(tp_indices) > 0:
+            tp_i = tp_indices[0]
+            df_pred.loc[df_pred["index"] == box_pred.index, ("TP", "GTID")] = (1, tp_i)
+            thresholds.append(box_pred.Score)
+
+    thresholds.append(df_pred["Score"].min() - 1.0)
+
+    tpr = []
+    fps = []
+
+    for th in sorted(thresholds, reverse=True):
+        df_th = df_pred.loc[df_pred["Score"] >= th]
+        df_th_unique_tp = df_th.reset_index().drop_duplicates(
+            subset=["StudyUID", "View", "TP", "GTID"]
+        )
+        n_tps_th = float(sum(df_th_unique_tp["TP"]))
+        tpr_th = n_tps_th / n_boxes
+        n_fps_th = float(len(df_th[df_th["TP"] == 0]))
+        fps_th = n_fps_th / n_volumes
+        tpr.append(tpr_th)
+        fps.append(fps_th)
+
+    result = {}
+    for x in (1, 2, 3, 4):
+        result[f"sensitivity_at_{x}_fps"] = np.interp(x, fps, tpr)
+    result["mean_sensitivity"] = np.mean(list(result.values()))
+
+    return result
+
+
+def is_tp(
+    box_pred: NamedTuple, box_true: NamedTuple, slice_offset: int, min_dist: int = 100
+) -> bool:
+    pred_y = box_pred.Y + box_pred.Height / 2
+    pred_x = box_pred.X + box_pred.Width / 2
+    pred_z = box_pred.Z + box_pred.Depth / 2
+    true_y = box_true.Y + box_true.Height / 2
+    true_x = box_true.X + box_true.Width / 2
+    true_z = box_true.Slice
+    # 2D distance between true and predicted center points
+    dist = np.linalg.norm((pred_x - true_x, pred_y - true_y))
+    # compute radius based on true box size
+    dist_threshold = np.sqrt(box_true.Width ** 2 + box_true.Height ** 2) / 2.
+    dist_threshold = max(dist_threshold, min_dist)
+    slice_diff = np.abs(pred_z - true_z)
+    # TP if predicted center within radius and slice within slice offset
+    return dist <= dist_threshold and slice_diff <= slice_offset
 
 
 def _get_dicom_laterality(ds: dicom.dataset.FileDataset) -> str:

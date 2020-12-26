@@ -1,4 +1,4 @@
-from typing import AnyStr, BinaryIO, Dict, NamedTuple, Optional, Union,
+from typing import AnyStr, BinaryIO, Dict, List, NamedTuple, Optional, Union
 
 import matplotlib
 import numpy as np
@@ -14,7 +14,7 @@ def dcmread_image(
 ) -> np.ndarray:
     """Read pixel array from DBT DICOM file"""
     ds = dicom.dcmread(fp)
-    ds.decompress(handler_name='pylibjpeg')
+    ds.decompress(handler_name="pylibjpeg")
     pixel_array = ds.pixel_array
     view_laterality = view[0].upper()
     image_laterality = _get_image_laterality(pixel_array[index or 0])
@@ -76,24 +76,23 @@ def draw_box(
 def evaluate(
     labels_fp: pd._typing.FilePathOrBuffer,
     boxes_fp: pd._typing.FilePathOrBuffer,
-    predictions_fp: pd._typing.FilePathOrBuffer
+    predictions_fp: pd._typing.FilePathOrBuffer,
 ) -> Dict[str, float]:
     """Evaluate predictions"""
     df_labels = pd.read_csv(labels_fp)
     df_boxes = pd.read_csv(boxes_fp, dtype={"VolumeSlices": float})
     df_pred = pd.read_csv(predictions_fp, dtype={"Score": float})
 
+    df_labels = df_labels.reset_index().set_index(["StudyUID", "View"]).sort_index()
     df_boxes = df_boxes.reset_index().set_index(["StudyUID", "View"]).sort_index()
     df_pred = df_pred.reset_index().set_index(["StudyUID", "View"]).sort_index()
-
-    n_volumes = len(df_labels)
-    n_boxes = len(df_boxes)
 
     df_pred["TP"] = 0
     df_pred["GTID"] = 0
 
     thresholds = [df_pred["Score"].max() + 1.0]
 
+    # find true positive predictions and assign detected ground truth box ID
     for box_pred in df_pred.itertuples():
         if box_pred.Index not in df_boxes.index:
             continue
@@ -101,7 +100,9 @@ def evaluate(
         df_boxes_view = df_boxes.loc[[box_pred.Index]]
         view_slice_offset = df_boxes.loc[[box_pred.Index], "VolumeSlices"].iloc[0] / 4
         tp_indices = [
-            b.index for b in df_boxes_view.itertuples() if is_tp(box_pred, b, slice_offset=view_slice_offset)
+            b.index
+            for b in df_boxes_view.itertuples()
+            if _is_tp(box_pred, b, slice_offset=view_slice_offset)
         ]
         if len(tp_indices) > 0:
             tp_i = tp_indices[0]
@@ -110,9 +111,49 @@ def evaluate(
 
     thresholds.append(df_pred["Score"].min() - 1.0)
 
+    # compute sensitivity at 2 FPs/volume on all cases
+    evaluation_fps_all = (2.0,)
+    tpr_all = _froc(
+        df_pred=df_pred,
+        thresholds=thresholds,
+        n_volumes=len(df_labels),
+        n_boxes=len(df_boxes),
+        evaluation_fps=evaluation_fps_all,
+    )
+    result = {f"sensitivity_at_2_fps_all": tpr_all[0]}
+
+    # compute mean sensitivity at 1, 2, 3, 4 FPs/volume on positive cases
+    df_pred = df_pred[df_pred.index.isin(df_boxes.index)]
+    df_labels = df_labels[df_labels.index.isin(df_boxes.index)]
+    evaluation_fps_positive = (1.0, 2.0, 3.0, 4.0)
+    tpr_positive = _froc(
+        df_pred=df_pred,
+        thresholds=thresholds,
+        n_volumes=len(df_labels),
+        n_boxes=len(df_boxes),
+        evaluation_fps=evaluation_fps_positive,
+    )
+
+    result.update(
+        dict(
+            (f"sensitivity_at_{int(x)}_fps_positive", y)
+            for x, y in zip(evaluation_fps_positive, tpr_positive)
+        )
+    )
+    result.update({"mean_sensitivity_positive": np.mean(tpr_positive)})
+
+    return result
+
+
+def _froc(
+    df_pred: pd.DataFrame,
+    thresholds: List[float],
+    n_volumes: int,
+    n_boxes: int,
+    evaluation_fps: tuple,
+) -> List[float]:
     tpr = []
     fps = []
-
     for th in sorted(thresholds, reverse=True):
         df_th = df_pred.loc[df_pred["Score"] >= th]
         df_th_unique_tp = df_th.reset_index().drop_duplicates(
@@ -124,16 +165,12 @@ def evaluate(
         fps_th = n_fps_th / n_volumes
         tpr.append(tpr_th)
         fps.append(fps_th)
-
-    result = {}
-    for x in (1, 2, 3, 4):
-        result[f"sensitivity_at_{x}_fps"] = np.interp(x, fps, tpr)
-    result["mean_sensitivity"] = np.mean(list(result.values()))
-
-    return result
+        if fps_th > max(evaluation_fps):
+            break
+    return [np.interp(x, fps, tpr) for x in evaluation_fps]
 
 
-def is_tp(
+def _is_tp(
     box_pred: NamedTuple, box_true: NamedTuple, slice_offset: int, min_dist: int = 100
 ) -> bool:
     pred_y = box_pred.Y + box_pred.Height / 2
@@ -145,7 +182,7 @@ def is_tp(
     # 2D distance between true and predicted center points
     dist = np.linalg.norm((pred_x - true_x, pred_y - true_y))
     # compute radius based on true box size
-    dist_threshold = np.sqrt(box_true.Width ** 2 + box_true.Height ** 2) / 2.
+    dist_threshold = np.sqrt(box_true.Width ** 2 + box_true.Height ** 2) / 2.0
     dist_threshold = max(dist_threshold, min_dist)
     slice_diff = np.abs(pred_z - true_z)
     # TP if predicted center within radius and slice within slice offset

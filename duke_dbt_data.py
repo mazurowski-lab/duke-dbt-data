@@ -88,7 +88,7 @@ def evaluate(
     df_pred = df_pred.reset_index().set_index(["StudyUID", "View"]).sort_index()
 
     df_pred["TP"] = 0
-    df_pred["GTID"] = 0
+    df_pred["GTID"] = -1
 
     thresholds = [df_pred["Score"].max() + 1.0]
 
@@ -99,13 +99,17 @@ def evaluate(
 
         df_boxes_view = df_boxes.loc[[box_pred.Index]]
         view_slice_offset = df_boxes.loc[[box_pred.Index], "VolumeSlices"].iloc[0] / 4
-        tp_indices = [
-            b.index
+        tp_boxes = [
+            b
             for b in df_boxes_view.itertuples()
             if _is_tp(box_pred, b, slice_offset=view_slice_offset)
         ]
-        if len(tp_indices) > 0:
-            tp_i = tp_indices[0]
+        if len(tp_boxes) > 1:
+            # find the nearest GT box
+            tp_distances = [_distance(box_pred, b) for b in tp_boxes]
+            tp_boxes = [tp_boxes[np.argmin(tp_distances)]]
+        if len(tp_boxes) > 0:
+            tp_i = tp_boxes[0].index
             df_pred.loc[df_pred["index"] == box_pred.index, ("TP", "GTID")] = (1, tp_i)
             thresholds.append(box_pred.Score)
 
@@ -187,6 +191,16 @@ def _is_tp(
     slice_diff = np.abs(pred_z - true_z)
     # TP if predicted center within radius and slice within slice offset
     return dist <= dist_threshold and slice_diff <= slice_offset
+
+
+def _distance(box_pred: NamedTuple, box_true: NamedTuple) -> float:
+    pred_y = box_pred.Y + box_pred.Height / 2
+    pred_x = box_pred.X + box_pred.Width / 2
+    pred_z = box_pred.Z + box_pred.Depth / 2
+    true_y = box_true.Y + box_true.Height / 2
+    true_x = box_true.X + box_true.Width / 2
+    true_z = box_true.Slice
+    return np.linalg.norm((pred_x - true_x, pred_y - true_y, pred_z - true_z))
 
 
 def _get_dicom_laterality(ds: dicom.dataset.FileDataset) -> str:
